@@ -1,0 +1,11 @@
+[Unit]
+Description=Privacy mode on the alert slider's top position (cameras and mics off)
+After=sound.target systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/local/bin/privacy-switch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

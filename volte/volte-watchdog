@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""!! NEW ZEALAND / One NZ SPECIFIC !! Written for a Mighty Mobile SIM on
+One NZ (530-01), using the Netherlands-VoLTE-Vodafone modem profile. Review
+before using on another carrier.
+
+volte-watchdog: notice when the modem loses IMS (VoLTE), log what the
+modem looked like at the time, and try to get IMS back.
+
+With One NZ's 3G switched off, calls need IMS. On 2026-10-24/25 IMS
+deregistered some time after a network detach and never came back: the
+modem stayed registered on LTE, SMS and data worked, outgoing calls stayed
+on "Calling..." and incoming calls went to voicemail. Disabling and
+re-enabling the modem (mmcli -d/-e) didn't help; a reboot did.
+
+Every CHECK_SECONDS it reads the IMS status (ims-status). After IMS has
+been unregistered for LOST_CHECKS checks in a row, with the modem
+registered on the network and no call going on, it:
+  1. checks the carrier profile, and re-activates Netherlands-VoLTE-Vodafone
+     (a SIM refresh, which re-registers IMS)
+  2. if IMS is still missing, restarts the modem's processor (remoteproc)
+     and runs volte-mcfg, which re-selects the profile
+  3. if IMS is still missing, tells the user to reboot (a notification),
+     and tries again only after RETRY_SECONDS.
+Each step, and IMS coming back, writes a snapshot to LOG_DIR: ModemManager's
+state, the IMS status, the active profile, and recent modem logs. Identifiers
+(IMEI, phone number, SIM IDs) are left out.
+
+`volte-watchdog --check` prints the status and a snapshot once, without
+fixing anything (works as the normal user).
+
+Runs as root (system unit volte-watchdog.service).
+"""
+import datetime
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+
+PROFILE = "Netherlands-VoLTE-Vodafone"
+PROFILE_ID = ("F4:09:0D:E2:C8:DA:9B:63:52:26:BE:7D:BB:80:5D:3D:DD:BA:92:B1")
+MODEM_REMOTEPROC = "4080000.remoteproc"
+IMS_STATUS = "/usr/local/bin/ims-status"
+VOLTE_MCFG = "/usr/local/bin/volte-mcfg"
+
+CHECK_SECONDS = 60
+LOST_CHECKS = 3  # IMS normally re-registers within ~10 s of a refresh
+SETTLE_SECONDS = 90  # after a fix, before checking again
+RETRY_SECONDS = 30 * 60  # after all fixes failed
+LOG_DIR = "/var/log/volte-watchdog"
+KEEP_SNAPSHOTS = 100
+# mmcli -K lines that identify the phone, the SIM or the user.
+PRIVATE = re.compile(r"imei|equipment-identifier|device-identifier|"
+                     r"own-numbers|iccid|imsi|\.sim\b|sim-slots", re.I)
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+def run(cmd, seconds=30):
+    """Output of cmd (stdout and stderr), or a note if it failed or hung.
+    qmicli catches SIGTERM and can hang while cleaning up, hence -k."""
+    try:
+        return subprocess.run(["timeout", "-k", "5", str(seconds)] + cmd,
+                              capture_output=True, text=True).stdout
+    except OSError as e:
+        return f"<{e}>"
+
+
+def modem_keys():
+    """mmcli -K output as a dict, private lines left out."""
+    keys = {}
+    for line in run(["mmcli", "-m", "any", "-K"]).splitlines():
+        key, sep, value = line.partition(":")
+        if sep and not PRIVATE.search(key):
+            keys[key.strip()] = value.strip()
+    return keys
+
+
+def ims_status():
+    """ims-status output as a dict ({} if it failed)."""
+    status = {}
+    for line in run(["python3", IMS_STATUS], 40).splitlines():
+        key, sep, value = line.strip().partition(": ")
+        if sep:
+            status[key] = value
+    return status
+
+
+def ims_registered(status):
+    return (status.get("ims_registration_status") == "2"
+            and status.get("ims_voice_service_status") == "2")
+
+
+def active_profile():
+    out = run(["qmicli", "-d", "qrtr://0", "--pdc-list-configs=software"])
+    name = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Description:"):
+            name = line.split(":", 1)[1].strip()
+        elif re.match(r"Status:\s*Active", line):
+            return name
+    return None
+
+
+def on_network(keys):
+    return keys.get("modem.3gpp.registration-state") in ("home", "roaming")
+
+
+def call_going_on():
+    for path in re.findall(r"/org/freedesktop/ModemManager1/Call/\d+",
+                           run(["mmcli", "-m", "any", "--voice-list-calls"])):
+        state = run(["mmcli", "-o", path, "-K"])
+        if not re.search(r"call\.properties\.state\s*:\s*terminated", state):
+            return True
+    return False
+
+
+def snapshot(event, keys=None, status=None, write=True):
+    """Write what the modem looks like now to LOG_DIR (or print it)."""
+    keys = keys if keys is not None else modem_keys()
+    status = status if status is not None else ims_status()
+    now = datetime.datetime.now()
+    parts = [
+        f"event: {event}",
+        f"time: {now.isoformat(timespec='seconds')}",
+        f"uptime: {run(['uptime']).strip()}",
+        f"carrier profile: {active_profile() or 'unknown'}",
+        "\n== ModemManager",
+        "\n".join(f"{k}: {v}" for k, v in keys.items()),
+        "\n== IMS",
+        "\n".join(f"{k}: {v}" for k, v in status.items()) or "<no answer>",
+        "\n== ModemManager log, last 2 h",
+        run(["journalctl", "--no-pager", "-q", "-u", "ModemManager",
+             "--since", "-2h"]).strip(),
+        "\n== Kernel, modem, last 2 h",
+        run(["sh", "-c", "journalctl --no-pager -q -k --since -2h | "
+             "grep -iE 'remoteproc|mss|modem|ipa|qrtr|rmnet'"]).strip(),
+        "\n== Watchdog log, last 2 h",
+        run(["journalctl", "--no-pager", "-q", "-u", "volte-watchdog",
+             "--since", "-2h"]).strip(),
+    ]
+    text = "\n".join(parts) + "\n"
+    if not write:
+        print(text)
+        return
+    name = f"{now:%Y%m%d-%H%M%S}-{re.sub(r'[^a-z0-9]+', '-', event.lower())}"
+    try:
+        os.makedirs(LOG_DIR, mode=0o755, exist_ok=True)
+        with open(f"{LOG_DIR}/{name}.txt", "w") as f:
+            f.write(text)
+        for old in sorted(os.listdir(LOG_DIR))[:-KEEP_SNAPSHOTS]:
+            os.remove(f"{LOG_DIR}/{old}")
+        log(f"snapshot: {LOG_DIR}/{name}.txt")
+    except OSError as e:
+        log("couldn't write snapshot:", e)
+
+
+def notify(title, body):
+    """Show a notification in every logged-in user's session."""
+    for uid in os.listdir("/run/user"):
+        if not os.path.exists(f"/run/user/{uid}/bus"):
+            continue
+        try:
+            user = pwd.getpwuid(int(uid)).pw_name
+        except (KeyError, ValueError):
+            continue
+        subprocess.run(["systemd-run", "--user", f"--machine={user}@.host",
+                        "--quiet", "--collect", "notify-send", "-u",
+                        "critical", "-i", "call-stop-symbolic", title, body])
+
+
+def reactivate_profile():
+    profile = active_profile()
+    log(f"carrier profile: {profile or 'unknown'}; activating {PROFILE}")
+    log(run(["qmicli", "-d", "qrtr://0",
+             f"--pdc-activate-config=software,{PROFILE_ID}"], 60).strip())
+
+
+def restart_modem():
+    for name in os.listdir("/sys/class/remoteproc"):
+        path = f"/sys/class/remoteproc/{name}"
+        with open(f"{path}/name") as f:
+            if f.read().strip() != MODEM_REMOTEPROC:
+                continue
+        log(f"restarting the modem ({name})")
+        for state in ("stop", "start"):
+            try:
+                with open(f"{path}/state", "w") as f:
+                    f.write(state)
+            except OSError as e:
+                log(f"{state}: {e}")
+            time.sleep(3)
+        # The modem picks its own profile again when it starts.
+        log(run([VOLTE_MCFG], 400).strip())
+        return
+    log("modem remoteproc not found")
+
+
+FIXES = [("re-activate profile", reactivate_profile),
+         ("restart modem", restart_modem)]
+
+
+def check():
+    keys, status = modem_keys(), ims_status()
+    print("on network:", on_network(keys), "| IMS voice:",
+          ims_registered(status), "| call going on:", call_going_on())
+    snapshot("check", keys, status, write=False)
+
+
+def main():
+    if "--check" in sys.argv:
+        return check()
+    log("started")
+    lost_since = None  # when IMS was first seen missing
+    misses = 0
+    next_fix = 0  # index into FIXES
+    no_network_logged = False
+    while True:
+        keys, status = modem_keys(), ims_status()
+        if ims_registered(status):
+            if lost_since is not None:
+                how = FIXES[next_fix - 1][0] if next_fix else "by itself"
+                log(f"IMS back after {time.time() - lost_since:.0f} s "
+                    f"({how})")
+                snapshot(f"ims back {how}", keys, status)
+            lost_since, misses, next_fix = None, 0, 0
+            no_network_logged = False
+            time.sleep(CHECK_SECONDS)
+            continue
+        if not status:
+            log("no answer from the modem's IMS service")
+        if not on_network(keys):
+            # Nothing to fix from here: no signal, flight mode or no SIM.
+            if not no_network_logged:
+                log("modem not on the network:",
+                    keys.get("modem.generic.state", "no modem"),
+                    keys.get("modem.3gpp.registration-state", ""))
+                no_network_logged = True
+            misses = 0
+            time.sleep(CHECK_SECONDS)
+            continue
+        no_network_logged = False
+        if lost_since is None:
+            lost_since = time.time()
+            log("IMS not registered:",
+                {k: v for k, v in status.items()
+                 if "registration" in k or "voice" in k})
+            snapshot("ims lost", keys, status)
+        misses += 1
+        if misses < LOST_CHECKS or call_going_on():
+            time.sleep(CHECK_SECONDS)
+            continue
+        if next_fix < len(FIXES):
+            name, fix = FIXES[next_fix]
+            next_fix += 1
+            log(f"fix {next_fix}: {name}")
+            fix()
+            time.sleep(SETTLE_SECONDS)
+            continue
+        log("IMS still missing after every fix; reboot needed")
+        snapshot("fixes failed", keys, status)
+        notify("Calls aren't working",
+               "The modem lost VoLTE and couldn't get it back. Restart "
+               "the phone to make and receive calls.")
+        next_fix, misses = 0, 0
+        time.sleep(RETRY_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

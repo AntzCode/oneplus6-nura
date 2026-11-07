@@ -1,0 +1,10 @@
+[Unit]
+Description=Mirror the call mic mute onto the codec (OnePlus 6)
+
+[Service]
+ExecStart=%h/.local/bin/call-mic-mute
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

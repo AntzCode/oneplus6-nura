@@ -1,0 +1,13 @@
+# NZ / One NZ specific: see volte/volte-mcfg. Review before using on another carrier.
+[Unit]
+Description=Watch the modem's VoLTE (IMS) registration and restore it
+After=ModemManager.service volte-mcfg.service
+Wants=ModemManager.service
+
+[Service]
+ExecStart=/usr/local/bin/volte-watchdog
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

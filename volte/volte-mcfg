@@ -1,0 +1,30 @@
+#!/bin/sh
+# !! NEW ZEALAND / One NZ SPECIFIC !! Written for a Mighty Mobile SIM on
+# One NZ (530-01). The profile below is the one that gave VoLTE there. It may
+# be wrong, or unavailable, on another carrier or in another country.
+#
+# Activate the Vodafone NL carrier profile (MCFG) for VoLTE on One NZ.
+# The modem auto-selects Oversea-Commercial_DS at every boot, which has no IMS.
+NAME=Netherlands-VoLTE-Vodafone
+ID=F4:09:0D:E2:C8:DA:9B:63:52:26:BE:7D:BB:80:5D:3D:DD:BA:92:B1
+
+# Wait (up to 5 min) until the modem has read the SIM and registered,
+# so the modem's own auto-selection has already happened.
+i=0
+until mmcli -m any 2>/dev/null | grep -q -E '^\s+\|\s+state: .*(registered|connected)'; do
+	i=$((i + 1))
+	[ $i -ge 60 ] && { echo "modem not registered, giving up"; exit 1; }
+	sleep 5
+done
+
+# The PDC list sometimes hangs, so retry it. qmicli catches SIGTERM and can
+# hang while cleaning up, so -k kills it 5 s later.
+for try in 1 2 3; do
+	active=$(timeout -k 5 30 qmicli -d qrtr://0 --pdc-list-configs=software 2>&1 |
+		awk '/Description:/ { d = $2 } /Status: *Active/ { print d }')
+	[ -n "$active" ] && break
+done
+echo "active profile: ${active:-unknown}"
+[ "$active" = "$NAME" ] && exit 0
+
+timeout -k 5 60 qmicli -d qrtr://0 --pdc-activate-config=software,$ID

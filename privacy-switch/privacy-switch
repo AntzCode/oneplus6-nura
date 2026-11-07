@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""privacy-switch: the OnePlus 6 alert slider's top position is privacy mode.
+
+In privacy mode the cameras and microphones are off:
+- Cameras: their device files (video, media and v4l-subdev nodes, except
+  the video codec's) are made root-only, and WirePlumber is restarted, so
+  it can't open them again: no app sees a camera, through PipeWire or
+  directly. Unbinding the camera driver instead left WirePlumber, which
+  holds the cameras open, stuck in the kernel, unkillable until a reboot.
+- Microphones: every mic's digital gain in the codec (DEC0-8 Volume) is set
+  to 0. That silences them for recordings and for calls (call audio goes
+  from the mic to the modem inside the DSP, never through a capture device).
+  Changes made meanwhile (UCM, call-mic-mute) are set back to 0 at once.
+
+Leaving the top position turns both back on, restoring the saved gains.
+While privacy mode is on, STATE_FILE exists, for og-home-panel's indicator.
+The sound profile (silent, vibrate, ring) is still fbd-alert-slider's job.
+
+Runs as root (system unit privacy-switch.service).
+"""
+import fcntl
+import json
+import os
+import pty
+import pwd
+import select
+import struct
+import subprocess
+import sys
+import time
+
+SLIDER_NAME = "Alert slider"
+ABS_SND_PROFILE = 0x22
+TOP = 0  # SND_PROFILE_SILENT; middle is 1 (vibrate), bottom 2 (ring)
+EVIOCGABS = 0x80184540  # _IOR('E', 0x40 + axis, struct input_absinfo)
+EVENT = struct.Struct("qqHHi")  # struct input_event on 64-bit
+EV_ABS = 3
+
+CAMERA_MODE = 0o660  # root:video, as udev creates them
+
+CARD = "0"
+MICS = [f"DEC{i} Volume" for i in range(9)]
+# UCM's boot values, for when no saved gains exist (privacy mode at boot).
+DEFAULT_GAINS = {"DEC0 Volume": 75, "DEC6 Volume": 75, "DEC7 Volume": 75}
+DEFAULT_GAIN = 84
+STATE_DIR = "/run/privacy-switch"
+SAVED_GAINS = f"{STATE_DIR}/gains.json"
+STATE_FILE = f"{STATE_DIR}/on"
+# How often to re-check, besides reacting to the slider and mixer events.
+# logind gives the session access to the cameras again when it starts.
+CHECK_SECONDS = 2
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+def find_slider():
+    for name in os.listdir("/sys/class/input"):
+        try:
+            with open(f"/sys/class/input/{name}/device/name") as f:
+                if name.startswith("event") and f.read().strip() == SLIDER_NAME:
+                    return f"/dev/input/{name}"
+        except OSError:
+            pass
+    return None
+
+
+def slider_position(slider):
+    info = bytearray(24)
+    fcntl.ioctl(slider, EVIOCGABS + ABS_SND_PROFILE, info)
+    return struct.unpack("6i", info)[0]
+
+
+def camera_nodes():
+    """The cameras' device files: every video4linux and media device except
+    the video codec's (qcom-venus)."""
+    nodes = []
+    for cls in ("/sys/class/video4linux", "/sys/bus/media/devices"):
+        for name in os.listdir(cls) if os.path.isdir(cls) else []:
+            if "video-codec" not in os.path.realpath(f"{cls}/{name}/device"):
+                nodes.append(f"/dev/{name}")
+    return [node for node in nodes if os.path.exists(node)]
+
+
+def set_cameras(on):
+    """Returns True if any device file changed."""
+    mode = CAMERA_MODE if on else 0o600
+    changed = False
+    for node in camera_nodes():
+        if os.stat(node).st_mode & 0o777 != mode:
+            os.chmod(node, mode)
+            changed = True
+    if changed:
+        log("cameras", "on" if on else "off")
+    return changed
+
+
+def restart_wireplumber():
+    """Restart every user's WirePlumber, so it drops or finds the cameras."""
+    users = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() == "wireplumber":
+                    users.add(pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid)
+                              .pw_name)
+        except (OSError, KeyError):
+            pass
+    for user in users:
+        subprocess.run(["systemctl", "--user", f"--machine={user}@.host",
+                        "--no-block", "restart", "wireplumber"])
+        log("restarted wireplumber for", user)
+
+
+def get_gain(control):
+    out = subprocess.run(["amixer", "-c", CARD, "cget", f"name={control}"],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.strip().startswith(": values="):
+            return int(line.split("=")[1])
+    return None
+
+
+def set_gain(control, value):
+    subprocess.run(["amixer", "-q", "-c", CARD, "cset", f"name={control}",
+                    str(value)])
+
+
+def mute_mics():
+    gains = {control: get_gain(control) for control in MICS}
+    if any(gains.values()):
+        # Keep the gains from before privacy mode, not the zeros.
+        if not os.path.exists(SAVED_GAINS):
+            with open(SAVED_GAINS, "w") as f:
+                json.dump(gains, f)
+    for control, gain in gains.items():
+        if gain:
+            set_gain(control, 0)
+            log(f"{control}: {gain} -> 0")
+
+
+def unmute_mics():
+    try:
+        with open(SAVED_GAINS) as f:
+            saved = json.load(f)
+        os.remove(SAVED_GAINS)
+    except (OSError, ValueError):
+        saved = {}
+    for control in MICS:
+        gain = saved.get(control) or DEFAULT_GAINS.get(control, DEFAULT_GAIN)
+        if get_gain(control) == 0:
+            set_gain(control, gain)
+            log(f"{control}: 0 -> {gain}")
+
+
+def set_state(private):
+    if private:
+        open(STATE_FILE, "a").close()
+    elif os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+
+
+def apply(private):
+    set_state(private)
+    if set_cameras(not private):
+        restart_wireplumber()
+    if private:
+        mute_mics()
+    else:
+        unmute_mics()
+
+
+def main():
+    # Readable by everyone, so the panel can watch STATE_FILE.
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    path = find_slider()
+    if not path:
+        log("no", SLIDER_NAME, "found")
+        sys.exit(1)
+    slider = open(path, "rb", buffering=0)
+    # Mixer changes, to keep the mics at 0 while private. On a pipe amixer
+    # would buffer its output, so it writes to a pseudo-terminal.
+    reader, writer = pty.openpty()
+    subprocess.Popen(["amixer", "-c", CARD, "events"], stdout=writer)
+    os.close(writer)
+    mixer = os.fdopen(reader, "r")
+    private = slider_position(slider) == TOP
+    log("privacy mode", "on" if private else "off", "at start")
+    apply(private)
+    last_check = time.monotonic()
+    while True:
+        ready, _, _ = select.select([slider, mixer], [], [],
+                                    CHECK_SECONDS)
+        if slider in ready:
+            data = slider.read(EVENT.size * 64)
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _s, _us, kind, code, value = EVENT.unpack_from(data, i)
+                if kind == EV_ABS and code == ABS_SND_PROFILE:
+                    if (value == TOP) != private:
+                        private = value == TOP
+                        log("privacy mode", "on" if private else "off")
+                        apply(private)
+        if mixer in ready:
+            try:
+                line = mixer.readline()
+            except OSError:  # The pty closes with an error when amixer exits
+                line = ""
+            if not line:
+                log("amixer events exited")
+                sys.exit(1)  # systemd restarts the service
+            if private and "DEC" in line:
+                mute_mics()
+        # On a timer, so a stream of mixer events can't hold it off.
+        if private and time.monotonic() - last_check >= CHECK_SECONDS:
+            last_check = time.monotonic()
+            apply(private)  # In case something re-enabled them
+
+
+if __name__ == "__main__":
+    main()

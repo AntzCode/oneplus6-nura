@@ -1,0 +1,14 @@
+# Firmware and images (download separately; see docs)
+*.zip
+*.img
+9.0.9-*/
+oxygenos-*/
+nura-*/
+efs-backup-*/
+
+# Device-specific data and screenshots
+*.png
+device-info.md
+
+__pycache__/
+*.pyc

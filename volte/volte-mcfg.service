@@ -1,0 +1,12 @@
+# NZ / One NZ specific: see volte/volte-mcfg. Review before using on another carrier.
+[Unit]
+Description=Select the VoLTE carrier profile on the modem
+After=ModemManager.service
+Wants=ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/volte-mcfg
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Make the Calls app's mute button work on the OnePlus 6.
+# Call audio goes mic -> DSP -> modem without passing through PulseAudio, so
+# PulseAudio's (software) source mute never reaches the other side. Mirror it
+# onto DEC7, the bottom mic's digital gain in the codec: 0 silences the call mic.
+SOURCE=alsa_input.platform-sound.Voice_Call__Mic__source
+GAIN=75 # BootSequence value in the sdm845 UCM config
+
+apply() {
+	if pactl get-source-mute "$SOURCE" 2>/dev/null | grep -q yes; then
+		want=0
+	else
+		want=$GAIN
+	fi
+	have=$(amixer -c0 cget name='DEC7 Volume' | sed -n 's/.*: values=//p')
+	if [ "$have" != "$want" ]; then
+		amixer -q -c0 cset name='DEC7 Volume' "$want"
+		echo "DEC7 Volume $have -> $want"
+	fi
+}
+
+apply
+pactl subscribe | while read -r line; do
+	case "$line" in
+	*" on source "* | *" on card "*) apply ;;
+	esac
+done
