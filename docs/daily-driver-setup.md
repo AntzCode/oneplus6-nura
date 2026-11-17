@@ -334,7 +334,7 @@ Status: in daily use since 2026-10-19; see the repo's README for current behavio
 
 Symptom: Chatty showed a constant "Chatty cannot process 40 MMSes… MMSC is not configured" notification, and some SMS arrived several times (first noticed 2026-10-26 12:36).
 
-Cause of the notification: mmsd-tng (`~/.mms/modemmanager/mms`) was on placeholder values (`http://mms.invalid`, `apn.invalid`), so 40 incoming MMS notifications queued unprocessed. The duplicate-SMS cause is not confirmed; the network may be re-sending unacknowledged MMS notifications.
+Cause of the notification: mmsd-tng (`~/.mms/modemmanager/mms`) was on placeholder values (`http://mms.invalid`, `apn.invalid`), so 40 incoming MMS notifications queued unprocessed. The duplicate SMS had a different cause; see "Duplicate SMS after suspend" below.
 
 Fix (one NZ / Vodafone NZ, 530-01). Stop `mmsd-tng` first, because it rewrites the file:
 - `CarrierMMSC=http://pxt.vodafone.net.nz/pxtsend`
@@ -343,3 +343,39 @@ Fix (one NZ / Vodafone NZ, 530-01). Stop `mmsd-tng` first, because it rewrites t
 - Move the stale queue files (everything except `mms`) out of `~/.mms/modemmanager/`, then `systemctl --user start mmsd-tng`.
 
 The MMSC and proxy values are unverified until a real MMS is received. Queued notifications pointed at `pxt.one.nz`, which may be the current host. A backup of the old queue is at `~/mms-backup-20261108-081416` on the phone.
+
+## Duplicate SMS after suspend (2026-11-17)
+
+Symptom: a text sent once arrived many times (up to 39 copies), usually in a burst when the phone woke. Chatty's history shows it from 2026-10-19 on.
+
+Cause: the modem's SMS route for messages with no class (normal texts) was `transfer-only`: the modem passes the SMS to ModemManager without acknowledging it to the network, and ModemManager must send the acknowledgement. While the phone is suspended nothing acknowledges, so the network re-sends the text every 80–160 s. On wake, all queued copies are delivered. ModemManager only sets the class 0 and 1 routes, so it never changes this one.
+
+Fix: make the modem store and acknowledge these messages itself. ModemManager then reads them from modem storage on wake:
+
+```sh
+qmicli -d qrtr://0 --wms-set-routes="type=point,class=none,storage=nv,receipt-action=store-and-notify"
+qmicli -d qrtr://0 --wms-get-routes     # "Message Class: none" should show nv / store-and-notify
+```
+
+Tested 2026-11-17: four texts received while awake, and one sent during a 72 min suspend, each arrived once. Undo with `--wms-set-routes="type=point,class=none,storage=none,receipt-action=transfer-only"`.
+
+The modem resets the route at every start (confirmed after a reboot, 2026-11-17 21:43), so `sms/` holds a boot service:
+- `sms-route`: waits until the modem has registered, sets the route if needed, and checks it again twice, 15 s apart, in case `volte-mcfg`'s profile switch resets it. Logs each read-back and fails if the route is still wrong.
+- `sms-route.service`: a oneshot system unit, run after ModemManager and `volte-mcfg`.
+- `volte-watchdog` runs `sms-route` after each of its fixes (profile re-activation and modem restart).
+
+Install:
+
+```sh
+scp sms/sms-route sms/sms-route.service user@172.16.42.1:/home/user/
+ssh -t user@172.16.42.1 'sudo install -m 755 /home/user/sms-route /usr/local/bin/sms-route && sudo install -m 644 /home/user/sms-route.service /etc/systemd/system/sms-route.service && sudo systemctl daemon-reload && sudo systemctl enable --now sms-route.service'
+```
+
+Check after a boot: `journalctl -b -u sms-route` should end with `route: nv/store-and-notify`. A minute or more after boot, `qmicli -d qrtr://0 --wms-get-routes` should still show it.
+
+Open points:
+- A modem crash that the watchdog doesn't handle resets the route until the next reboot (texts then duplicate after suspend again).
+- Texts split into several parts and MMS notifications haven't been tested on the new route.
+- An incoming SMS doesn't wake the phone from suspend (calls do). A text sent during suspend appears on the next wake; Chatty shows the network's send time, not the time it arrived.
+- ModemManager logged `failed deleting SMS message … Couldn't delete 1 parts` for the text read from storage after resume. The modem listed no unread messages afterwards, but whether the read copy was left in storage is unconfirmed. A check of every slot showed them empty, but only after a reboot, and `rmtfs` runs with `-r` (read-only), so the modem's NV storage is discarded at every boot anyway. Check the slots after the next text received during suspend, before rebooting. If copies stay behind, storage will fill up and texts will stop arriving until a reboot.
+- On the old route, one text also arrived twice while the phone was awake (2026-11-17 15:05–15:06). That remains unexplained.

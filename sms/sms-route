@@ -1,0 +1,42 @@
+#!/bin/sh
+# Make the modem store and acknowledge normal (class-less) SMS itself.
+#
+# By default the route for these is transfer-only: the modem hands the SMS to
+# ModemManager unacknowledged. While the phone is suspended nobody acknowledges
+# it, so the network re-sends it every 1-3 min and every copy arrives on wake.
+# With store-and-notify the modem acks it, keeps it in NV storage, and
+# ModemManager reads (and deletes) it on wake.
+#
+# The modem resets the route at every start, so this runs at boot (after
+# volte-mcfg, whose profile switch may reset it too) and after the
+# watchdog restarts the modem.
+SET='type=point,class=none,storage=nv,receipt-action=store-and-notify'
+
+# Wait (up to 5 min) until the modem has registered.
+i=0
+until mmcli -m any 2>/dev/null | grep -q -E '^\s+\|\s+state: .*(registered|connected)'; do
+	i=$((i + 1))
+	[ $i -ge 60 ] && { echo "modem not registered, giving up"; exit 1; }
+	sleep 5
+done
+
+# Print the class-less route as "storage/receipt-action".
+route() {
+	timeout -k 5 20 qmicli -d qrtr://0 --wms-get-routes 2>&1 |
+		awk '/Message Class:/ { c = $3 } /Storage Type:/ { s = $3 }
+		     /Receipt Action:/ && c == "none" { print s "/" $3 }'
+}
+
+# Check again after a pause, in case a profile switch still in progress
+# resets the route behind us.
+for try in 1 2 3; do
+	now=$(route)
+	echo "route: ${now:-unknown}"
+	if [ "$now" != nv/store-and-notify ]; then
+		timeout -k 5 20 qmicli -d qrtr://0 --wms-set-routes="$SET"
+		now=$(route)
+		echo "route set: ${now:-unknown}"
+	fi
+	[ $try -lt 3 ] && sleep 15
+done
+[ "$now" = nv/store-and-notify ]

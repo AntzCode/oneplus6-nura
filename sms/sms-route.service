@@ -1,0 +1,11 @@
+[Unit]
+Description=Have the modem acknowledge incoming SMS itself (no duplicates after suspend)
+After=ModemManager.service volte-mcfg.service
+Wants=ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sms-route
+
+[Install]
+WantedBy=multi-user.target

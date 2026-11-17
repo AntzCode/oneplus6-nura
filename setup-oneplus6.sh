@@ -63,6 +63,7 @@ ssh "$host" "rm -rf $stage && mkdir -p $stage"
 scp -q "$here/volte/volte-mcfg" "$here/volte/volte-mcfg.service" \
     "$here/volte/volte-watchdog" "$here/volte/volte-watchdog.service" \
     "$here/volte/ims-status.py" \
+    "$here/sms/sms-route" "$here/sms/sms-route.service" \
     "$here/privacy-switch/privacy-switch" \
     "$here/privacy-switch/privacy-switch.service" \
     "$here/call-audio/call-mic-mute" "$here/call-audio/call-mic-mute.service" \
@@ -95,6 +96,10 @@ install -m 755 $stage/ims-status.py /usr/local/bin/ims-status
 install -m 755 $stage/volte-watchdog /usr/local/bin/volte-watchdog
 install -m 644 $stage/volte-watchdog.service /etc/systemd/system/
 
+echo "- SMS route: modem acknowledges SMS itself (no duplicates after suspend)"
+install -m 755 $stage/sms-route /usr/local/bin/sms-route
+install -m 644 $stage/sms-route.service /etc/systemd/system/
+
 echo "- privacy mode on the alert slider"
 install -m 755 $stage/privacy-switch /usr/local/bin/privacy-switch
 install -m 644 $stage/privacy-switch.service /etc/systemd/system/
@@ -103,6 +108,7 @@ systemctl daemon-reload
 systemctl enable volte-mcfg.service
 systemctl enable volte-watchdog.service
 systemctl restart volte-watchdog.service
+systemctl enable sms-route.service
 systemctl enable privacy-switch.service
 systemctl restart privacy-switch.service
 
@@ -165,5 +171,5 @@ cat <<'DONE'
 - MMS: set CarrierMMSC, MMS_APN and CarrierMMSProxy in
   ~/.mms/modemmanager/mms (see docs/daily-driver-setup.md, MMS section).
 - Reboot, then check: journalctl -b -u volte-mcfg, -u volte-watchdog,
-  -u privacy-switch.
+  -u sms-route, -u privacy-switch.
 DONE

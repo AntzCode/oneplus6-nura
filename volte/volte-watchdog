@@ -43,6 +43,7 @@ PROFILE_ID = ("F4:09:0D:E2:C8:DA:9B:63:52:26:BE:7D:BB:80:5D:3D:DD:BA:92:B1")
 MODEM_REMOTEPROC = "4080000.remoteproc"
 IMS_STATUS = "/usr/local/bin/ims-status"
 VOLTE_MCFG = "/usr/local/bin/volte-mcfg"
+SMS_ROUTE = "/usr/local/bin/sms-route"
 
 CHECK_SECONDS = 60
 LOST_CHECKS = 3  # IMS normally re-registers within ~10 s of a refresh
@@ -259,6 +260,9 @@ def main():
             next_fix += 1
             log(f"fix {next_fix}: {name}")
             fix()
+            # A profile switch or modem restart may reset the SMS route.
+            if os.path.exists(SMS_ROUTE):
+                log(run([SMS_ROUTE], 400).strip())
             time.sleep(SETTLE_SECONDS)
             continue
         log("IMS still missing after every fix; reboot needed")

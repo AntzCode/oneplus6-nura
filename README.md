@@ -17,6 +17,7 @@ It covers the OxygenOS downgrade and flashing, installing Nura with Phosh, and t
 | `flash-linux.sh`, `flash-oos11.sh` | Flash OxygenOS 9.0.9 / 11 on both slots, skipping `persist` and the critical partitions |
 | `setup-oneplus6.sh` | Applies the daily-driver setup over SSH. Contains **One NZ specific** steps (APN, VoLTE) |
 | `volte/` | **One NZ specific.** VoLTE profile selection and IMS watchdog |
+| `sms/` | Boot service that stops duplicate SMS after suspend (modem acknowledges SMS itself) |
 | `privacy-switch/`, `call-audio/` | Generic helper services installed on the phone by the setup script |
 | `verification/` | Scripts used to check the OTA images |
 | `reports/` | Upstream issue reports |
